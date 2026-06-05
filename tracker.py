@@ -4,18 +4,26 @@ from bs4 import BeautifulSoup
 import sqlite3
 import asyncio
 from datetime import datetime, timedelta
-
 import os
+import urllib.parse
+import threading
+from flask import Flask
 
+# ---------------- ENV ----------------
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
-QUERY = 'site:reddit.com "u/sane_mwm"'
+RAW_QUERIES = os.getenv(
+    "QUERY",
+    'site:reddit.com "u/sane_mwm"'
+)
+
+QUERIES = [q.strip() for q in RAW_QUERIES.split(";")]
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # ---------------- DATABASE ----------------
-conn = sqlite3.connect("tracker.db")
+conn = sqlite3.connect("tracker.db", check_same_thread=False)
 c = conn.cursor()
 
 c.execute("""
@@ -29,8 +37,10 @@ conn.commit()
 
 def save_link(url):
     try:
-        c.execute("INSERT INTO activity VALUES (?, ?)",
-                  (url, datetime.utcnow().isoformat()))
+        c.execute(
+            "INSERT INTO activity VALUES (?, ?)",
+            (url, datetime.utcnow().isoformat())
+        )
         conn.commit()
         return True
     except:
@@ -38,7 +48,9 @@ def save_link(url):
 
 
 def get_all():
-    return c.execute("SELECT * FROM activity ORDER BY first_seen DESC").fetchall()
+    return c.execute(
+        "SELECT * FROM activity ORDER BY first_seen DESC"
+    ).fetchall()
 
 
 def get_last_month():
@@ -51,18 +63,23 @@ def get_last_month():
 
 # ---------------- SCRAPER ----------------
 def fetch_links():
-    url = f"https://www.google.com/search?q={QUERY}&num=20"
-    res = requests.get(url, headers=HEADERS)
-    soup = BeautifulSoup(res.text, "html.parser")
-
     links = set()
 
-    for a in soup.select("a"):
-        href = a.get("href", "")
-        if "/url?q=" in href and "reddit.com" in href:
-            clean = href.split("/url?q=")[1].split("&")[0]
-            if "/comments/" in clean:
-                links.add(clean)
+    for query in QUERIES:
+        url = f"https://www.google.com/search?q={urllib.parse.quote(query)}&num=20"
+        res = requests.get(url, headers=HEADERS)
+
+        if res.status_code != 200:
+            continue
+
+        soup = BeautifulSoup(res.text, "html.parser")
+
+        for a in soup.select("a"):
+            href = a.get("href", "")
+            if "/url?q=" in href and "reddit.com" in href:
+                clean = href.split("/url?q=")[1].split("&")[0]
+                if "/comments/" in clean:
+                    links.add(clean)
 
     return links
 
@@ -90,10 +107,9 @@ async def tracker_loop():
             if save_link(link):
                 await channel.send(f"🆕 New activity found:\n{link}")
 
-        await asyncio.sleep(3600)  # every 1 hour
+        await asyncio.sleep(3600)  # 1 hour
 
 
-# ---------------- COMMANDS ----------------
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
@@ -134,4 +150,31 @@ async def on_message(message):
         await message.channel.send(msg)
 
 
-bot.run(TOKEN)
+# ---------------- FLASK SERVER ----------------
+app = Flask(__name__)
+
+
+@app.route("/")
+def home():
+    return "Tracker is running"
+
+
+def run_flask():
+    port = int(os.getenv("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+
+# ---------------- STARTUP ----------------
+def start_bot():
+    if not TOKEN:
+        raise ValueError("Missing DISCORD_TOKEN")
+
+    bot.run(TOKEN)
+
+
+if __name__ == "__main__":
+    # Start Flask in a separate thread
+    threading.Thread(target=run_flask).start()
+
+    # Start Discord bot (blocking)
+    start_bot()
